@@ -1,0 +1,69 @@
+---
+import '../styles/global.css';
+import { convenioActivo } from '../lib/sources/antecedentes';
+const auditoria = convenioActivo();
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+const {
+  title = 'ConsultaEC — Datos públicos del Ecuador en una sola búsqueda',
+  description = 'Consulta por cédula, nombres, RUC o razón social: SRI, Función Judicial, Fiscalía, Ministerio del Interior, Supercias y contratación pública.',
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#f5f2ea" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;1,6..72,400&display=swap"
+      rel="stylesheet"
+    />
+    <title>{title}</title>
+  </head>
+  <body>
+    <header class="topbar">
+      <a href="/" class="brand" aria-label="ConsultaEC, inicio">
+        <span class="brand-mark" aria-hidden="true">
+          <i style="background:var(--yellow)"></i><i style="background:var(--blue)"></i><i style="background:var(--red)"></i>
+        </span>
+        Consulta<em>EC</em>
+      </a>
+      <nav class="topnav">
+        <a href="/#fuentes">Fuentes</a>
+        <a href="/#aviso">Uso responsable</a>
+      </nav>
+    </header>
+    <main>
+      <slot />
+    </main>
+    <footer class="footer" id="aviso">
+      <div class="wrap footer-grid">
+        <div>
+          <p class="footer-title">Uso responsable</p>
+          <p>
+            ConsultaEC reúne información que las instituciones del Estado ecuatoriano publican en sus portales oficiales. No
+            almacena los resultados más allá de una caché temporal en memoria.
+            {auditoria && ' Las consultas de antecedentes penales por convenio quedan registradas (cédula, motivo, fecha e IP), como exige el convenio.'} Los datos personales están
+            protegidos por la Ley Orgánica de Protección de Datos Personales (LOPDP): úsalos solo con un fin legítimo.
+          </p>
+        </div>
+        <div>
+          <p class="footer-title">Sin validez oficial</p>
+          <p>
+            Los resultados son referenciales. Para trámites usa siempre el certificado o documento emitido por la institución
+            correspondiente. Figurar en un proceso judicial o una noticia del delito no implica culpabilidad.
+          </p>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

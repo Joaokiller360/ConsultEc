@@ -1,0 +1,179 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import { cached, fetchT, fmtDate, money } from '../../lib/http';
+import { clientIp, limited } from '../../lib/ratelimit';
+import { SERCOP_API } from '../../lib/sources/sercop';
+
+export const prerender = false;
+
+type Any = Record<string, any>;
+const ocid = Astro.params.ocid ?? '';
+let release: Any | null = null;
+let error = '';
+
+if (!/^ocds-[\w-]{1,80}$/.test(ocid)) {
+  error = 'Identificador de proceso no válido.';
+  Astro.response.status = 400;
+} else if (limited(clientIp(Astro.request, () => Astro.clientAddress))) {
+  error = 'Demasiadas consultas. Espera un minuto.';
+  Astro.response.status = 429;
+} else {
+  try {
+    const data = await cached(`sercop:record:${ocid}`, 60 * 60_000, async () => {
+      const res = await fetchT(`${SERCOP_API}/record?ocid=${encodeURIComponent(ocid)}`, {}, 20000);
+      if (!res.ok) throw new Error(`SERCOP respondió ${res.status}`);
+      return res.json();
+    });
+    // fusiona releases en orden (las últimas prevalecen) → vista compilada simple
+    release = (data.releases ?? []).reduce((acc: Any, r: Any) => ({ ...acc, ...r }), {});
+    if (!release || !Object.keys(release).length) error = 'Proceso no encontrado.';
+  } catch (e) {
+    error = e instanceof Error ? e.message : 'Error al consultar SERCOP.';
+  }
+}
+
+const amt = (v?: Any) => (v?.amount != null ? money(Number(v.amount)) : '—');
+const tender: Any = release?.tender ?? {};
+const awards: Any[] = release?.awards ?? [];
+const contracts: Any[] = release?.contracts ?? [];
+const parties: Any[] = release?.parties ?? [];
+const items: Any[] = awards[0]?.items ?? tender.items ?? [];
+const title = tender.title || release?.ocid || ocid;
+const description: string = tender.description || awards[0]?.description || '';
+const ruc = (id?: string) => id?.match(/RUC-(\d{13})/)?.[1] ?? '';
+---
+
+<Layout title={`${title} · Contratación pública · ConsultaEC`}>
+  <section class="doc wrap">
+    <a class="back" href="/" onclick="if(history.length>1){history.back();return false}">← Volver a resultados</a>
+    {
+      error ? (
+        <>
+          <h1>No se pudo cargar el proceso</h1>
+          <p class="summary">{error}</p>
+        </>
+      ) : (
+        <>
+          <p class="eyebrow" style="margin:18px 0 0">SERCOP · {ocid}</p>
+          <h1>{title}</h1>
+          {description && <p class="lede" style="margin-bottom:0">{description}</p>}
+
+          <dl class="stats" style="margin-top:24px">
+            <div class="stat"><dt>Entidad contratante</dt><dd style="font-size:19px">{release!.buyer?.name ?? '—'}</dd></div>
+            <div class="stat"><dt>Presupuesto referencial</dt><dd>{amt(tender.value)}</dd></div>
+            <div class="stat"><dt>Monto adjudicado</dt><dd>{amt(awards[0]?.value)}</dd></div>
+            <div class="stat"><dt>Fecha</dt><dd style="font-size:19px">{fmtDate(release!.date)}</dd></div>
+          </dl>
+
+          <div class="grid">
+            <article class="card">
+              <div class="card-head"><div><p class="card-inst">Adjudicación</p><h3 class="card-title">Proveedores</h3></div></div>
+              <div class="card-body">
+                {awards.flatMap((a) => a.suppliers ?? []).length ? (
+                  <dl class="fields" style="grid-template-columns:1fr">
+                    {awards.flatMap((a) =>
+                      (a.suppliers ?? []).map((s: Any) => (
+                        <div>
+                          <dt>{ruc(s.id) ? `RUC ${ruc(s.id)}` : s.id}</dt>
+                          <dd>
+                            {ruc(s.id) ? <a href={`/?q=${ruc(s.id)}&m=empresa`}>{s.name}</a> : s.name}
+                            <span class="ms"> · {amt(a.value)} · {fmtDate(a.date)}</span>
+                          </dd>
+                        </div>
+                      )),
+                    )}
+                  </dl>
+                ) : (
+                  <p class="summary">Sin adjudicación registrada.</p>
+                )}
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-head"><div><p class="card-inst">Proceso</p><h3 class="card-title">Datos del procedimiento</h3></div></div>
+              <div class="card-body">
+                <dl class="fields" style="grid-template-columns:1fr 1fr">
+                  <div><dt>Método</dt><dd>{tender.procurementMethodDetails ?? tender.procurementMethod ?? '—'}</dd></div>
+                  <div><dt>Estado</dt><dd>{tender.status ?? '—'}</dd></div>
+                  <div><dt>Etapas</dt><dd>{(release!.tag ?? []).join(' · ') || '—'}</dd></div>
+                  <div><dt>Consultas/preguntas</dt><dd>{tender.enquiries?.length ?? 0}</dd></div>
+                  {tender.tenderPeriod?.startDate && <div><dt>Inicio</dt><dd>{fmtDate(tender.tenderPeriod.startDate)}</dd></div>}
+                  {tender.tenderPeriod?.endDate && <div><dt>Cierre</dt><dd>{fmtDate(tender.tenderPeriod.endDate)}</dd></div>}
+                </dl>
+              </div>
+            </article>
+
+            {contracts.length > 0 && (
+              <article class="card full">
+                <div class="card-head"><div><p class="card-inst">Contratos</p><h3 class="card-title">{contracts.length} contrato(s) firmados</h3></div></div>
+                <div class="card-body scroll">
+                  <table>
+                    <thead><tr><th>ID</th><th>Firmado</th><th>Vigencia</th><th>Estado</th><th>Monto</th></tr></thead>
+                    <tbody>
+                      {contracts.map((c) => (
+                        <tr>
+                          <td>{c.id}</td>
+                          <td>{fmtDate(c.dateSigned)}</td>
+                          <td>{c.period ? `${fmtDate(c.period.startDate)} → ${fmtDate(c.period.endDate)}` : '—'}</td>
+                          <td>{c.status ?? '—'}</td>
+                          <td>{amt(c.value)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            )}
+
+            {items.length > 0 && (
+              <article class="card full">
+                <div class="card-head"><div><p class="card-inst">Objeto</p><h3 class="card-title">Ítems ({items.length})</h3></div></div>
+                <div class="card-body scroll">
+                  <table>
+                    <thead><tr><th>Descripción</th><th>CPC</th><th>Cantidad</th><th>Precio unitario</th></tr></thead>
+                    <tbody>
+                      {items.map((it) => (
+                        <tr>
+                          <td>{it.description || it.classification?.description || '—'}</td>
+                          <td>{it.classification ? `${it.classification.id} · ${it.classification.description ?? ''}` : '—'}</td>
+                          <td>{it.quantity ?? '—'} {it.unit?.name ?? ''}</td>
+                          <td>{amt(it.unit?.value)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            )}
+
+            {parties.length > 0 && (
+              <article class="card full">
+                <div class="card-head"><div><p class="card-inst">Participantes</p><h3 class="card-title">Partes del proceso ({parties.length})</h3></div></div>
+                <div class="card-body scroll">
+                  <table>
+                    <thead><tr><th>Nombre</th><th>Identificación</th><th>Rol</th><th>Ubicación</th></tr></thead>
+                    <tbody>
+                      {parties.map((p) => (
+                        <tr>
+                          <td>{p.name}</td>
+                          <td>{ruc(p.id) || p.id}</td>
+                          <td>{(p.roles ?? []).join(', ')}</td>
+                          <td>{[p.address?.locality, p.address?.region].filter(Boolean).join(', ') || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            )}
+          </div>
+
+          <p class="note" style="margin-top:24px">
+            Fuente: Portal de Datos Abiertos de Contratación Pública (SERCOP), estándar OCDS, licencia CC BY 3.0 EC.{' '}
+            <a href={`${SERCOP_API}/record?ocid=${encodeURIComponent(ocid)}`} target="_blank" rel="noopener">Ver registro OCDS original ↗</a>
+          </p>
+        </>
+      )
+    }
+  </section>
+</Layout>

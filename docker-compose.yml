@@ -1,0 +1,50 @@
+# ConsultaEC en un VPS: app + Caddy (HTTPS automático con Let's Encrypt).
+#
+#   cp .env.example .env      # completa DOMAIN y, si tienes convenios, sus credenciales
+#   docker compose up -d --build
+#
+# La app no se expone directamente: solo Caddy publica los puertos 80/443.
+
+services:
+  app:
+    build: .
+    image: consultec:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4321
+      TRUST_PROXY: "1"            # la IP real llega por X-Forwarded-For desde Caddy
+    volumes:
+      - ./data:/app/data          # data/supercias.db (npm run data:supercias)
+      - ./logs:/app/logs          # auditoría de consultas por convenio
+    expose:
+      - "4321"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?Define DOMAIN en .env (p. ej. consulta.midominio.com)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,589 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { ORDER, SOURCES } from '../lib/sources';
+import { convenioActivo } from '../lib/sources/antecedentes';
+import { superciasConvenioActivo } from '../lib/sources/supercias';
+
+export const prerender = false; // refleja en tiempo real si el convenio está configurado
+
+const LINK_ONLY = new Set([
+  ...(convenioActivo() ? [] : ['antecedentes']),
+  ...(superciasConvenioActivo() ? [] : ['supercias']),
+]);
+const catalog = SOURCES.map(({ id, name, institution, officialUrl, supports }) => ({
+  id,
+  name,
+  institution,
+  officialUrl,
+  supports,
+  access: LINK_ONLY.has(id) ? 'link' : 'auto',
+}));
+---
+
+<Layout>
+  <section class="hero wrap">
+    <p class="eyebrow">Registros públicos · República del Ecuador</p>
+    <h1>Todo lo público, en <em>una</em> sola consulta.</h1>
+    <p class="lede">
+      Busca a una persona por cédula o nombres, o a una empresa por RUC o razón social. Reunimos en segundos lo que publican el
+      SRI, la Función Judicial, la Fiscalía, la Policía Nacional, INTERPOL, el Ministerio del Interior, la Supercias, la Superintendencia de Bancos, el SERCOP y la UAFE.
+    </p>
+
+    <form class="search" id="search" autocomplete="off" novalidate>
+      <div class="mode" role="group" aria-label="Tipo de búsqueda">
+        <button type="button" data-mode="persona" aria-pressed="true">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"
+            ><circle cx="12" cy="8" r="4"></circle><path d="M4 21c0-4 4-6 8-6s8 2 8 6"></path></svg
+          >
+          Persona
+        </button>
+        <button type="button" data-mode="empresa" aria-pressed="false">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"
+            ><rect x="4" y="3" width="16" height="18" rx="1"></rect><path d="M9 7h2M13 7h2M9 11h2M13 11h2M10 21v-4h4v4"></path></svg
+          >
+          Empresa
+        </button>
+      </div>
+      <div class="field">
+        <label class="input-wrap">
+          <span class="sr-only" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Criterio de búsqueda</span>
+          <input id="q" name="q" type="search" placeholder="Cédula (10 dígitos) o apellidos y nombres" spellcheck="false" maxlength="150" autocomplete="off" />
+          <span class="detect" id="detect">—</span>
+        </label>
+        <button class="go" id="go" type="submit">
+          Consultar
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"
+            ><path d="M5 12h14M13 6l6 6-6 6"></path></svg
+          >
+        </button>
+      </div>
+      <div class="hint">
+        <span id="hint-msg">Para nombres usa el orden <b>APELLIDOS NOMBRES</b>, como aparece en la cédula.</span>
+        <span>Pulsa <kbd>/</kbd> para buscar</span>
+      </div>
+    </form>
+  </section>
+
+  <section class="results wrap" id="results" hidden aria-live="polite">
+    <div class="subject">
+      <div>
+        <p class="eyebrow" id="subject-kind" style="margin:0">Resultado</p>
+        <h2 id="subject-name">—</h2>
+        <span class="id" id="subject-id"></span>
+        <div class="chips" id="subject-chips"></div>
+      </div>
+      <nav class="progress" id="progress" aria-label="Estado de las fuentes"></nav>
+    </div>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section class="sources wrap" id="fuentes">
+    <h2>Fuentes consultadas</h2>
+    <ul class="source-list" style="padding:0;margin:0">
+      {
+        catalog.map((s) => (
+          <li>
+            <strong>
+              {s.name}
+              <span class={`tag ${s.access}`}>{s.access === 'auto' ? 'Automático' : 'Enlace oficial'}</span>
+            </strong>
+            <span>{s.institution}</span>
+          </li>
+        ))
+      }
+    </ul>
+  </section>
+
+  <script id="catalog" type="application/json" set:html={JSON.stringify({ catalog, order: ORDER })} />
+</Layout>
+
+<script>
+  import { detect } from '../lib/validate';
+  import type { Cell, Mode, SourceResult, Status, Table } from '../lib/types';
+  import { LEVEL_RANK, matchLevel, nameTokens, type MatchLevel } from '../lib/match';
+
+  type Meta = { id: string; name: string; institution: string; officialUrl: string; supports: string[]; access: string };
+  const { catalog, order } = JSON.parse(document.getElementById('catalog')!.textContent!) as {
+    catalog: Meta[];
+    order: Record<Mode, string[]>;
+  };
+  const meta = (id: string) => catalog.find((c) => c.id === id)!;
+
+  const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+  const form = $<HTMLFormElement>('search');
+  const input = $<HTMLInputElement>('q');
+  const badge = $('detect');
+  const hintMsg = $('hint-msg');
+  const go = $<HTMLButtonElement>('go');
+  const results = $('results');
+  const cards = $('cards');
+  const progress = $('progress');
+
+  let mode: Mode = 'persona';
+  let run = 0;
+
+  const STATUS_LABEL: Record<Status | 'loading', string> = {
+    loading: 'Consultando',
+    ok: 'Con resultados',
+    empty: 'Sin registros',
+    manual: 'Verificar en portal',
+    na: 'No aplica',
+    error: 'Error',
+  };
+  const KIND_LABEL = { cedula: 'Cédula', ruc: 'RUC', nombre: 'Nombre' } as const;
+  const PLACEHOLDER: Record<Mode, string> = {
+    persona: 'Cédula (10 dígitos) o apellidos y nombres',
+    empresa: 'RUC (13 dígitos) o razón social',
+  };
+  const DEFAULT_HINT = hintMsg.innerHTML;
+
+  /* ---------- DOM helper (todo texto externo va por textContent) ---------- */
+  type Child = Node | string | null | undefined | false;
+  function h(tag: string, attrs: Record<string, string | undefined> = {}, ...children: Child[]) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) if (v !== undefined) el.setAttribute(k, v);
+    for (const c of children) if (c) el.append(c);
+    return el;
+  }
+  const safeHref = (u: string) => (/^(https?:\/\/|\/(?!\/))/.test(u) ? u : '#');
+
+  /* ---------- modo + detección en vivo ---------- */
+  function setMode(m: Mode) {
+    mode = m;
+    form.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
+    input.placeholder = PLACEHOLDER[m];
+    hintMsg.innerHTML =
+      m === 'persona' ? DEFAULT_HINT : 'Escribe el RUC de 13 dígitos o la razón social tal como está registrada.';
+    updateBadge();
+  }
+  form.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) =>
+    b.addEventListener('click', () => {
+      setMode(b.dataset.mode as Mode);
+      input.focus();
+    }),
+  );
+
+  function updateBadge() {
+    const v = input.value.trim();
+    if (!v) {
+      badge.textContent = '—';
+      badge.dataset.state = '';
+      return;
+    }
+    const d = detect(v, mode);
+    if (d.ok) {
+      badge.textContent = `✓ ${KIND_LABEL[d.kind]}`;
+      badge.dataset.state = 'ok';
+    } else if (/^\d+$/.test(v.replace(/[\s.-]/g, '')) && v.replace(/\D/g, '').length < 10) {
+      badge.textContent = `${v.replace(/\D/g, '').length} díg.`;
+      badge.dataset.state = '';
+    } else {
+      badge.textContent = 'Revisar';
+      badge.dataset.state = 'bad';
+    }
+  }
+  input.addEventListener('input', updateBadge);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === '/' && document.activeElement !== input) {
+      e.preventDefault();
+      input.focus();
+      input.select();
+    }
+  });
+
+  /* ---------- render ---------- */
+  function pill(s: Status | 'loading') {
+    return h('span', { class: 'pill', 'data-s': s }, h('span', { class: 'dot', 'data-s': s }), STATUS_LABEL[s]);
+  }
+
+  function renderCell(c: Cell): Node | string {
+    if (typeof c === 'string') return c;
+    if ('img' in c) {
+      if (!/^https:\/\//.test(c.img)) return '—';
+      const img = h('img', { class: 'thumb', src: c.img, alt: c.alt ?? '', loading: 'lazy', referrerpolicy: 'no-referrer' }) as HTMLImageElement;
+      img.addEventListener('click', () => img.classList.toggle('big'));
+      img.addEventListener('error', () => img.replaceWith('—'));
+      return img;
+    }
+    return h('a', { href: safeHref(c.href), target: c.href.startsWith('/') ? undefined : '_blank', rel: 'noopener' }, c.text);
+  }
+
+  function renderTable(t: Table, open: boolean) {
+    const thead = h('thead', {}, h('tr', {}, ...t.columns.map((c) => h('th', {}, c))));
+    const tbody = h(
+      'tbody',
+      {},
+      ...t.rows.map((r) =>
+        h(
+          'tr',
+          {},
+          ...r.map((c) => h('td', {}, renderCell(c))),
+        ),
+      ),
+    );
+    const d = h(
+      'details',
+      { class: 'tbl' },
+      h('summary', {}, t.title ?? `${t.rows.length} registro(s)`),
+      h('div', { class: 'scroll' }, h('table', {}, thead, tbody)),
+    ) as HTMLDetailsElement;
+    d.open = open;
+    return d;
+  }
+
+  function cardShell(m: Meta) {
+    const link = h('a', { class: 'src-link', href: m.officialUrl, target: '_blank', rel: 'noopener' }, 'Fuente oficial ↗');
+    return h(
+      'article',
+      { class: 'card', id: `card-${m.id}` },
+      h(
+        'header',
+        { class: 'card-head' },
+        h('div', {}, h('p', { class: 'card-inst' }, m.institution), h('h3', { class: 'card-title' }, m.name)),
+        h('div', { class: 'card-meta' }, h('span', { class: 'ms' }), pill('loading'), link),
+      ),
+      h('div', { class: 'card-body' }, h('div', { class: 'skeleton', style: 'width:70%' }), h('div', { class: 'skeleton', style: 'width:45%' })),
+    );
+  }
+
+  function fillCard(r: SourceResult, identifier: string) {
+    const card = $(`card-${r.id}`);
+    if (!card) return;
+    card.querySelector('.pill')!.replaceWith(pill(r.status));
+    if (r.elapsedMs) card.querySelector('.ms')!.textContent = `${(r.elapsedMs / 1000).toFixed(1)} s`;
+
+    const body = h('div', { class: 'card-body' });
+    if (r.summary) body.append(h('p', { class: 'summary' }, r.summary));
+
+    if (r.stats?.length) {
+      body.append(
+        h(
+          'dl',
+          { class: 'stats' },
+          ...r.stats.map((s) => h('div', { class: `stat${s.value.length > 18 ? ' small' : ''}` }, h('dt', {}, s.label), h('dd', {}, s.value))),
+        ),
+      );
+    }
+    if (r.fields?.length) {
+      body.append(h('dl', { class: 'fields' }, ...r.fields.map((f) => h('div', {}, h('dt', {}, f.label), h('dd', {}, f.value)))));
+    }
+    r.tables?.forEach((t, i) => body.append(renderTable(t, i === 0 && t.rows.length <= 12)));
+
+    if (r.status === 'manual' || r.status === 'error') {
+      const copy = h('button', { class: 'btn', type: 'button' }, 'Copiar identificador') as HTMLButtonElement;
+      copy.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(identifier).catch(() => {});
+        copy.textContent = '✓ Copiado';
+        setTimeout(() => (copy.textContent = 'Copiar identificador'), 1600);
+      });
+      body.append(
+        h(
+          'div',
+          { class: 'actions' },
+          h('a', { class: 'btn primary', href: safeHref(r.officialUrl), target: '_blank', rel: 'noopener' }, 'Abrir portal oficial ↗'),
+          copy,
+        ),
+      );
+    }
+    if (r.id === 'antecedentes' && r.status === 'manual') body.append(certUploader(identifier, card));
+    if (r.note) body.append(h('p', { class: `note${r.note.startsWith('⚠') ? ' alert' : ''}` }, r.note));
+    card.querySelector('.card-body')!.replaceWith(body);
+
+    const dot = progress.querySelector(`[data-id="${r.id}"] .dot`) as HTMLElement | null;
+    if (dot) dot.dataset.s = r.status;
+  }
+
+  /* ---------- INTERPOL: la API pública solo acepta peticiones del navegador ---------- */
+  const IP_API = 'https://ws-public.interpol.int/notices/v1/red';
+  const IP_PAGE = 'https://www.interpol.int/es/Como-trabajamos/Notificaciones/Notificaciones-rojas/Ver-las-notificaciones-rojas';
+  type IpNotice = {
+    entity_id: string;
+    name: string | null;
+    forename: string | null;
+    date_of_birth: string | null;
+    nationalities: string[] | null;
+    _links: { self: { href: string }; thumbnail?: { href: string } };
+  };
+
+  async function ipGet<T>(url: string): Promise<T> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal, credentials: 'omit', referrerPolicy: 'no-referrer' });
+      if (!res.ok) throw new Error(String(res.status));
+      return (await res.json()) as T;
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  /**
+   * Una consulta por cada palabra del nombre (INTERPOL busca por cualquier apellido) más todas las
+   * notificaciones de nacionalidad ecuatoriana; luego se filtra con la misma coincidencia que la Policía.
+   * Devuelve null si la API no responde: la tarjeta se queda con el enlace oficial.
+   */
+  async function interpolSearch(r: SourceResult): Promise<SourceResult | null> {
+    const name = r.fields?.find((f) => f.label === 'Nombre a buscar')?.value;
+    if (!name) return null;
+    const qt = nameTokens(name);
+    const t0 = performance.now();
+    const queries = [...new Set(qt)].slice(0, 5).map((t) => `name=${encodeURIComponent(t)}`);
+    queries.push('nationality=EC');
+    let lists: { total: number; _embedded?: { notices: IpNotice[] } }[];
+    try {
+      lists = await Promise.all(queries.map((p) => ipGet<{ total: number; _embedded?: { notices: IpNotice[] } }>(`${IP_API}?resultPerPage=160&${p}`)));
+    } catch {
+      return null;
+    }
+    const seen = new Map<string, IpNotice>();
+    for (const l of lists) for (const n of l._embedded?.notices ?? []) seen.set(n.entity_id, n);
+
+    const hits = [...seen.values()]
+      .map((n) => ({ n, level: matchLevel(qt, nameTokens(`${n.name ?? ''} ${n.forename ?? ''}`)) }))
+      .filter((x): x is { n: IpNotice; level: MatchLevel } => !!x.level)
+      .sort((a, b) => LEVEL_RANK[a.level] - LEVEL_RANK[b.level])
+      .slice(0, 10);
+
+    // Cargos y país que la solicita (ficha individual), solo para las coincidencias
+    const details = await Promise.all(
+      hits.map((x) =>
+        x.n._links.self.href.startsWith(`${IP_API}/`)
+          ? ipGet<{ arrest_warrants?: { charge?: string; issuing_country_id?: string }[] }>(x.n._links.self.href).catch(() => null)
+          : null,
+      ),
+    );
+
+    const base = {
+      id: r.id,
+      name: r.name,
+      officialUrl: r.officialUrl,
+      elapsedMs: Math.round(performance.now() - t0),
+      stats: [
+        { label: 'Notificaciones revisadas', value: String(seen.size) },
+        { label: 'Consulta', value: 'Desde tu navegador' },
+      ],
+    };
+    const note =
+      'Datos de las notificaciones rojas públicas de INTERPOL (se actualizan cada hora). Una notificación roja no es una orden de detención internacional. ' +
+      'INTERPOL limita su uso a informar al público y recibir información: no usar con otros fines ni comerciales.';
+
+    if (!hits.length) {
+      return { ...base, status: 'empty', summary: `«${name}» no tiene notificaciones rojas públicas de INTERPOL.`, note };
+    }
+    return {
+      ...base,
+      status: 'ok',
+      summary: `${hits.length} posible(s) coincidencia(s) en notificaciones rojas de INTERPOL. Verifica fecha de nacimiento y foto.`,
+      stats: [{ label: 'Coincidencias', value: String(hits.length) }, ...base.stats],
+      tables: [
+        {
+          title: 'Coincidencias',
+          columns: ['Foto', 'Coincidencia', 'Apellidos', 'Nombres', 'Nacimiento', 'Nacionalidad', 'Cargos', 'Solicitada por', 'Ficha'],
+          rows: hits.map(({ n, level }, i) => {
+            const w = details[i]?.arrest_warrants ?? [];
+            return [
+              n._links.thumbnail?.href?.startsWith(`${IP_API}/`) ? { img: n._links.thumbnail.href, alt: `${n.name ?? ''} ${n.forename ?? ''}` } : '—',
+              level,
+              n.name ?? '—',
+              n.forename ?? '—',
+              n.date_of_birth ?? '—',
+              (n.nationalities ?? []).join(', ') || '—',
+              w.map((x) => x.charge).filter(Boolean).join(' · ') || '—',
+              [...new Set(w.map((x) => x.issuing_country_id).filter(Boolean))].join(', ') || '—',
+              { text: n.entity_id, href: `${IP_PAGE}#${n.entity_id.replace('/', '-')}` },
+            ];
+          }),
+        },
+      ],
+      note: '⚠ Coincidencia de nombre no confirma identidad. ' + note,
+    };
+  }
+
+  /* ---------- certificado de antecedentes (PDF leído localmente) ---------- */
+  const fmt = (d?: Date) => (d ? d.toLocaleDateString('es-EC', { day: '2-digit', month: 'short', year: 'numeric' }) : '—');
+  const MAX_PDF = 5 * 1024 * 1024;
+
+  function certUploader(expected: string, card: HTMLElement) {
+    const input = h('input', { type: 'file', accept: 'application/pdf,.pdf', class: 'drop-input' }) as HTMLInputElement;
+    const out = h('div', { class: 'cert-out' });
+    const zone = h(
+      'label',
+      { class: 'drop' },
+      input,
+      h('strong', {}, 'Sube aquí el certificado PDF'),
+      h('span', {}, 'Arrastra el archivo descargado del portal o haz clic. Se lee en tu navegador: no se envía a ningún servidor.'),
+    );
+
+    async function handle(file?: File | null) {
+      if (!file) return;
+      out.replaceChildren();
+      if (file.size > MAX_PDF) return out.append(h('p', { class: 'note alert' }, 'El archivo supera 5 MB.'));
+      const head = new Uint8Array(await file.slice(0, 5).arrayBuffer());
+      if (String.fromCharCode(...head) !== '%PDF-') return out.append(h('p', { class: 'note alert' }, 'El archivo no es un PDF.'));
+
+      zone.classList.add('busy');
+      try {
+        const { pdfToText, parseCertText } = await import('../lib/antecedentes-pdf');
+        const info = parseCertText(await pdfToText(file));
+        out.append(renderCert(info, expected));
+        if (info.esCertificado && info.antecedentes) {
+          card.querySelector('.pill')!.replaceWith(pill('ok'));
+          const dot = progress.querySelector('[data-id="antecedentes"] .dot') as HTMLElement | null;
+          if (dot) dot.dataset.s = 'ok';
+        }
+      } catch (e) {
+        console.error(e);
+        out.append(h('p', { class: 'note alert' }, 'No se pudo leer el PDF. ¿Está dañado o protegido con contraseña?'));
+      } finally {
+        zone.classList.remove('busy');
+        input.value = '';
+      }
+    }
+
+    input.addEventListener('change', () => handle(input.files?.[0]));
+    zone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      zone.classList.add('over');
+    });
+    zone.addEventListener('dragleave', () => zone.classList.remove('over'));
+    zone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      zone.classList.remove('over');
+      handle(e.dataTransfer?.files?.[0]);
+    });
+
+    return h('div', { class: 'cert' }, zone, out);
+  }
+
+  function renderCert(info: import('../lib/antecedentes-pdf').CertInfo, expected: string) {
+    const warn: string[] = [];
+    if (!info.esCertificado) warn.push('El PDF no parece un Certificado de Antecedentes Penales del Ministerio del Interior.');
+    if (info.documento && expected && info.documento !== expected)
+      warn.push(`El certificado es de otro documento (${info.documento}), no de ${expected}.`);
+    if (info.vigente === false) warn.push('El certificado está caducado (validez de 90 días).');
+
+    const verdict =
+      info.antecedentes === 'NO'
+        ? h('div', { class: 'verdict ok' }, h('span', {}, 'Antecedentes penales'), h('b', {}, 'NO registra'))
+        : info.antecedentes === 'SI'
+          ? h('div', { class: 'verdict bad' }, h('span', {}, 'Antecedentes penales'), h('b', {}, 'SÍ registra'))
+          : h('div', { class: 'verdict' }, h('span', {}, 'Antecedentes penales'), h('b', {}, 'No se pudo determinar'));
+
+    const fields: [string, string][] = [
+      ['Nombre', info.nombre ?? '—'],
+      ['Documento', info.documento ?? '—'],
+      ['Emisión', fmt(info.emision)],
+      ['Válido hasta', `${fmt(info.validoHasta)}${info.vigente === undefined ? '' : info.vigente ? ' · vigente' : ' · caducado'}`],
+    ];
+    if (info.numero) fields.push(['N.º / código', info.numero]);
+
+    const text = h('details', { class: 'tbl' }, h('summary', {}, 'Texto extraído del PDF'), h('pre', { class: 'raw' }, info.texto));
+
+    return h(
+      'div',
+      {},
+      ...warn.map((w) => h('p', { class: 'note alert' }, `⚠ ${w}`)),
+      verdict,
+      h('dl', { class: 'fields' }, ...fields.map(([l, v]) => h('div', {}, h('dt', {}, l), h('dd', {}, v)))),
+      ...info.enlaces.map((u) => h('a', { class: 'btn', href: safeHref(u), target: '_blank', rel: 'noopener' }, 'Verificar en sitio oficial ↗')),
+      text,
+      h(
+        'p',
+        { class: 'note' },
+        'Lectura automática del texto del PDF: no valida la firma electrónica. Para comprobar autenticidad, valida el archivo con FirmaEC o el código de verificación del certificado.',
+      ),
+    );
+  }
+
+  function updateSubjectFromSri(r: SourceResult) {
+    if (r.status !== 'ok' || !r.fields) return;
+    const get = (l: string) => r.fields!.find((f) => f.label === l)?.value;
+    const name = get('Razón social');
+    if (name) $('subject-name').textContent = name;
+    const chips = $('subject-chips');
+    chips.replaceChildren(
+      ...[get('Estado'), get('Tipo'), get('Actividad principal')]
+        .filter(Boolean)
+        .map((t) => h('span', { class: 'chip' }, t!.length > 60 ? t!.slice(0, 58) + '…' : t!)),
+    );
+    if (r.note?.startsWith('⚠')) chips.append(h('span', { class: 'chip warn' }, r.note.slice(2)));
+  }
+
+  /* ---------- consulta ---------- */
+  async function consult(raw: string, m: Mode, push = true) {
+    const d = detect(raw, m);
+    if (!d.ok) {
+      hintMsg.innerHTML = '';
+      hintMsg.append(h('span', { class: 'err' }, d.reason));
+      input.focus();
+      return;
+    }
+    const id = ++run;
+    if (push) history.pushState({}, '', `?${new URLSearchParams({ q: raw.trim(), m })}`);
+    setMode(m);
+    go.disabled = true;
+
+    results.hidden = false;
+    $('subject-kind').textContent = `${m === 'persona' ? 'Persona' : 'Empresa'} · ${KIND_LABEL[d.kind]}`;
+    $('subject-name').textContent = d.kind === 'nombre' ? d.value : 'Consultando…';
+    $('subject-id').textContent = d.kind === 'nombre' ? '' : d.value;
+    $('subject-chips').replaceChildren();
+
+    const ids = order[m];
+    cards.replaceChildren(...ids.map((sid) => cardShell(meta(sid))));
+    progress.replaceChildren(
+      ...ids.map((sid) => {
+        const b = h('button', { type: 'button', 'data-id': sid }, h('span', { class: 'dot', 'data-s': 'loading' }), meta(sid).institution.split(' · ')[0]);
+        b.addEventListener('click', () => $(`card-${sid}`)?.scrollIntoView({ behavior: 'smooth' }));
+        return b;
+      }),
+    );
+    results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    await Promise.all(
+      ids.map(async (sid) => {
+        let r: SourceResult;
+        try {
+          const res = await fetch(`/api/consulta/${sid}?${new URLSearchParams({ q: raw.trim(), m })}`);
+          const data = await res.json();
+          r = res.ok ? data : { id: sid, name: meta(sid).name, officialUrl: meta(sid).officialUrl, status: 'error', summary: data.error ?? 'Error' };
+        } catch {
+          r = { id: sid, name: meta(sid).name, officialUrl: meta(sid).officialUrl, status: 'error', summary: 'No se pudo contactar al servidor.' };
+        }
+        if (id !== run) return;
+        fillCard(r, d.value);
+        if (sid === 'interpol' && r.status === 'manual') {
+          const found = await interpolSearch(r);
+          if (found && id === run) fillCard(found, d.value);
+        }
+        if (sid === 'sri') {
+          updateSubjectFromSri(r);
+          if (r.status !== 'ok' && d.kind !== 'nombre') $('subject-name').textContent = d.value;
+        }
+      }),
+    );
+    if (id === run) go.disabled = false;
+  }
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    consult(input.value, mode);
+  });
+
+  function fromUrl() {
+    const p = new URLSearchParams(location.search);
+    const q = p.get('q');
+    const m: Mode = p.get('m') === 'empresa' ? 'empresa' : 'persona';
+    setMode(m);
+    if (q) {
+      input.value = q;
+      updateBadge();
+      consult(q, m, false);
+    } else {
+      results.hidden = true;
+    }
+  }
+  window.addEventListener('popstate', fromUrl);
+  fromUrl();
+</script>
